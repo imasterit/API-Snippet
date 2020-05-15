@@ -1,0 +1,35 @@
+{
+    "plugins": [
+        "plugins/markdown"
+    ],
+    "source": {
+        "include": [
+            "./src",
+            "package.json",
+            "README.md"
+        ],
+        "includePattern": ".js$",
+        "excludePattern": "(node_modules/|docs)"
+    },
+    "tags": {
+        "allowUnknownTags": [
+            "typedef"
+        ],
+        "dictionaries": [
+            "jsdoc",
+            "closure"
+        ]
+    },
+    "markdown": {
+        "parser": "gfm",
+        "hardwrap": true
+    },
+    "templates": {
+        "name": "Takweya telegram bot",
+        "footerText": "Bot for students asking questions to teachers"
+    },
+    "opts": {
+        "encoding": "utf8",
+        "recurse": true
+    }
+}

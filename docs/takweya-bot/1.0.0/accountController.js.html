@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: accountController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: accountController.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>'use strict';
+import {AccountBalance, Profile, Topic, User, UserState, Subscriptions} from './dbModels';
+import {loadTranslation} from "./languageController";
+
+/**
+ * Gets user data from database
+ * @param telegramId
+ * @returns {Promise&lt;*>} mongoose object User
+ */
+const getUser = async (telegramId) => {
+    let user;
+    console.info("searching for User", telegramId);
+
+    try {
+        user = await User.findOne({telegramId})
+            .populate('state profile accountBalance')
+            .populate({
+                path: 'profile',
+                populate: ['profilePicture', 'topics', 'lastQuestion']
+            })
+            .exec();
+    } catch (err) {
+        console.error(err);
+    }
+
+    if (user) {
+        console.info(`got user for telegramId ${telegramId}:`, user);
+    } else {
+        console.info("user not found for", telegramId);
+    }
+
+    return user;
+};
+
+/**
+ * Saves user state for finite state machine
+ * @param fsm
+ * @param currentMachineName
+ * @returns {Promise&lt;boolean>}
+ */
+const saveUserState = async (fsm, currentMachineName) => {
+    console.info("saveUserState started with state", fsm.state);
+    if (!fsm || !fsm.user || !fsm.user.state) return;
+
+    if (currentMachineName !== 'MainMachine') {
+        fsm.user.state.subState = fsm.state;
+    } else {
+        fsm.user.state.state = fsm.state;
+    }
+
+    if (fsm.state !== "none" &amp;&amp; fsm.state !== "initial") {
+        console.info("saving user state:", fsm.user.state);
+
+        let res = await fsm.user.state.save();
+
+        console.info(`saved state for ${fsm.user._id} => ${fsm.state}`, res);
+    }
+
+    //*****DEBUG
+    // const res = await UserState.findById(fsm.user._id).exec();
+    // console.info("saved state:", res);
+    //*****
+    return true;
+};
+
+/**
+ * Creates new user
+ * @param telegramId
+ * @param telegramUsername
+ * @param firstName
+ * @param lastName
+ * @returns {Promise&lt;void>} mongoose User object
+ */
+const createNewUser = async (telegramId, telegramUsername, firstName, lastName) => {
+    const user = new User({telegramId});
+    user.profile = new Profile({userId: user._id, telegramUsername, firstName, lastName});
+    user.accountBalance = new AccountBalance({userId: user._id});
+    user.state = new UserState({userId: user._id});
+
+    //before registration user doesn't exist
+    //because he needs a phone and email as unique keys
+
+    await user.save();
+    //just in case..
+    await user.profile.save();
+    await user.accountBalance.save();
+    await user.state.save();
+
+    console.info("created new user", user);
+
+    return user;
+};
+
+/**
+ * Removes user from database
+ * @param telegramId
+ * @returns {Promise&lt;boolean>}
+ */
+async function clearUser(telegramId) {
+    console.info("clearUser searching for", telegramId);
+    const user = await User.findOne({telegramId})
+        .populate('state profile accountBalance')
+        .populate({
+            path: 'profile',
+            populate: ['profilePicture', 'lastQuestion', 'pictures', 'questions']
+        })
+        .populate({
+            path: 'profile',
+            populate: {
+                path: 'questions',
+                populate: ['pictures']
+            }
+        })
+        .exec();
+
+
+    let found;
+
+    if (!user) {
+        console.info("clearUser user with telegramId not found", telegramId);
+        return;
+    } else {
+        console.info("clearUser found", user);
+        found = true;
+    }
+
+    const userId = user._id;
+    try {
+        if (user.state)
+            await user.state.remove();
+        console.info("clearUser state removed", telegramId);
+        if (user.accountBalance)
+            await user.accountBalance.remove();
+        console.info("clearUser accountBalance removed", telegramId);
+        if (user.profile) {
+            if (user.profile.profilePicture)
+                await user.profile.profilePicture.remove();
+            console.info("clearUser profilePicture removed", telegramId);
+            if (user.profile.pictures)
+                await user.profile.pictures.remove();
+            console.info("clearUser profile pictures removed", telegramId);
+            if (user.profile.lastQuestion)
+                await user.profile.lastQuestion.remove();
+            console.info("clearUser profile lastQuestion removed", telegramId);
+            for (let i in user.profile.questions) {
+                if (user.profile.questions.hasOwnProperty(i)) {
+                    const question = user.profile.questions[i];
+                    if (question.pictures &amp;&amp; question.pictures.length) {
+                        await question.pictures.remove();
+                    }
+                }
+            }
+            console.info("clearUser profile questions pictures removed", telegramId);
+            if (user.profile &amp;&amp; user.profile.questions &amp;&amp; user.profile.questions.length) {
+                await user.profile.questions.remove();
+            }
+            console.info("clearUser profile questions removed", telegramId);
+            await user.profile.remove();
+            console.info("clearUser profile removed", telegramId);
+        }
+        await user.remove();
+        console.info("clearUser user removed", telegramId);
+
+        const subscriptions = await Subscriptions.find({}).exec();
+        for (let i in subscriptions) {
+            if (subscriptions.hasOwnProperty(i)) {
+                await subscriptions[i].teachers.pull(userId);
+                await subscriptions[i].save();
+            }
+        }
+        console.info("clearUser subscriptions for user removed", userId);
+    } catch (err) {
+        console.info(err.message);
+    }
+    console.info("clearUser user removed", telegramId);
+
+
+    const userCheck = await User.findOne({telegramId})
+        .populate('state profile accountBalance')
+        .populate({
+            path: 'profile',
+            populate: ['profilePicture', 'lastQuestion', 'pictures', 'questions']
+        })
+        .populate({
+            path: 'profile',
+            populate: {
+                path: 'questions',
+                populate: ['pictures']
+            }
+        })
+        .exec();
+
+    console.info("clearUser checking if deleted:", userCheck);
+
+    return found;
+}
+
+/**
+ * Gets topics list from database excluding provided list of topics
+ * @param excludeTopics
+ * @returns {Promise&lt;boolean|*>}
+ */
+const getTopicsFromDbExcluding = async (excludeTopics) => {
+    try {
+        const result = await Topic.find({_id: {$nin: excludeTopics}}).exec();
+        if (result) {
+            console.info("getTopicsFromDbExcluding Got topics without excluded",
+                result);
+            return result;
+        }
+    } catch (err) {
+        console.error(err);
+    }
+    return false;
+};
+
+/**
+ * Adds +1000$ to user's balance for debug purposes
+ * @param fsm
+ * @returns {Promise&lt;void>}
+ */
+const rechargeBalance = async ({fsm}) => {
+    console.info('rechargeBalance', fsm.user, fsm.user.accountBalance.balance);
+    fsm.user.accountBalance.balance += 1000;
+    await fsm.user.accountBalance.save();
+    await fsm.user.say('Current balance is', {
+        parameters: {
+            balance: fsm.user.accountBalance.balance,
+            currency: fsm.user.accountBalance.currency
+        }
+    });
+};
+
+/**
+ * Returns from Main Machine with the command to start User question machine
+ * @param from
+ * @returns {{switchToSubmachine: string}|boolean}
+ */
+const runIneedHelp = ({from}) => {
+    if (from === 'signingIn' || from === 'requestPassword'
+        || from === 'passwordEmail' || from === 'user_registration' || from === 'language_choosing') return false;
+
+    return {switchToSubmachine: "UserQuestionMachine"};
+};
+
+/**
+ * Checks if user state is present
+ * @param user
+ * @returns {*|subState|{type}|boolean|*}
+ */
+const checkUserState = (user) => {
+    if (!user.state) {
+        return false;
+    } else if (user.state.subState) {
+        return user.state.subState;
+    } else {
+        return user.state.state;
+    }
+};
+
+/**
+ * Gets user object, user state, loads translation or creates a new user
+ * @param telegramId
+ * @param event
+ * @returns {Promise&lt;void>}
+ */
+const getUserAndStates = async (telegramId, event) => {
+    const result = {};
+    console.info("getUserAndStates", telegramId);
+    result.user = await getUser(telegramId);
+
+    if (result.user) {
+        console.info("getUserAndStates, checking state");
+
+        //if user found just save the state to a var
+        //to use it in GOTO of state machine after its creation
+        result.savedState = checkUserState(result.user);
+
+        console.info("getUserAndStates, checking language");
+        //load user's language translation if not loaded
+        if (result.user.language) await loadTranslation(false, result.user.language);
+
+        console.info("getUserAndStates",
+            result.user, result.savedState, result.subMachine);
+    } else {
+        ////////////////////////////////////
+        //absolutely new user
+        console.info("getUserAndStates creating new User", telegramId);
+
+        let telegramUsername, firstName, lastName;
+        if (event &amp;&amp; event.message
+            &amp;&amp; event.message.from) {
+
+            if (event.message.from.username)
+                telegramUsername = event.message.from.username;
+            if (event.message.from.first_name)
+                firstName = event.message.from.first_name;
+            if (event.message.from.last_name)
+                lastName = event.message.from.last_name;
+
+        }
+
+        result.user = await createNewUser(telegramId, telegramUsername, firstName, lastName);
+        console.info("getUserAndStates created new User", telegramId);
+    }
+
+    return result;
+};
+
+export {
+    getTopicsFromDbExcluding,
+    saveUserState,
+    getUser,
+    createNewUser,
+    clearUser,
+    rechargeBalance,
+    runIneedHelp,
+    getUserAndStates
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

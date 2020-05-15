@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: dbModels/User.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: dbModels/User.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import * as mongoose from "mongoose";
+import bcrypt from 'bcryptjs';
+import i18next from 'i18next';
+import {sendMessageToTelegram, showArrayAsMenuInTelegram} from "../telegramController";
+
+const UserSchema = new mongoose.Schema({
+    telegramId: {type: Number, unique: true},
+    phoneNumber: {type: Number},
+    email: {type: String},
+    password: {type: String},
+    language: {type: String},
+    defaultGrade: {type: Number, default: 0},
+    isVerified: {type: Boolean, default: false},
+    isRegistered: {type: Boolean, default: false},
+    roles: {
+        student: {type: Boolean, default: false},
+        teacher: {type: Boolean, default: false},
+        admin: {type: Boolean, default: false},
+    },
+    profile: {type: mongoose.Schema.Types.ObjectId, ref: 'profile'},
+    accountBalance: {type: mongoose.Schema.Types.ObjectId, ref: 'accountBalance'},
+    subscriptions: [{type: mongoose.Schema.Types.ObjectId, ref: 'topic'}],
+    availableToSubscribe: [{type: mongoose.Schema.Types.ObjectId, ref: 'topic'}],
+    questionsQueue: [{type: mongoose.Schema.Types.ObjectId, ref: 'question'}],
+    state: {type: mongoose.Schema.Types.ObjectId, ref: 'userState', autopopulate: true},
+    messageCache: [{type: Number}],
+    busy: {type: Boolean, default: false}
+}, {collection: 'users', timestamps: true});
+
+UserSchema.pre('save', function (next) {
+    if (this.isModified('email')) {
+        this.email = this.email.toLowerCase();
+        return next();
+    }
+
+    // only hash the password if it has been modified (or is new)
+    if (!this.isModified('password')) {
+        return next();
+    }
+
+    var user = this;
+
+    // generate a salt
+    bcrypt.genSalt(10, (error, salt) => {
+        if (error) {
+            return next(error);
+        }
+
+        // hash the password using the new salt
+        bcrypt.hash(user.password, salt, function (error, hash) {
+            if (error) {
+                return next(error);
+            }
+            // override the cleartext password with the hashed one
+            user.password = hash;
+            return next();
+        });
+    });
+});
+
+/**
+ * Compares passwords hashes
+ * @param passw
+ * @returns {Promise&lt;any>}
+ */
+UserSchema.methods.comparePassword = function (passw) {
+    return new Promise((resolve, reject) => {
+        bcrypt.compare(passw, this.password, function (err, isMatch) {
+            if (err) {
+                return reject(err);
+            }
+            return resolve(isMatch);
+        });
+    });
+};
+
+/**
+ * Translates message to user's language
+ * @param message
+ * @param namespace
+ * @param parameters
+ * @returns {string}
+ */
+UserSchema.methods.translate = function (message, namespace, parameters) {
+    if (namespace) {
+        message = `${namespace}:${message}`;
+    }
+
+    if (parameters) {
+        Object.keys(parameters).forEach(key => {
+            parameters[key] = i18next.t(parameters[key]);
+        });
+        return i18next.t(message, {...parameters, lng: this.language});
+    } else {
+        return i18next.t(message, {lng: this.language});
+    }
+};
+
+/**
+ * Translates message and sends it to telegram
+ * @param message
+ * @param args
+ * @returns {Promise&lt;boolean|Promise&lt;*>>}
+ */
+UserSchema.methods.say = async function (message, args = {}) {
+    console.info("UserSchema.say", message,args,"this.language",this.language);
+    if(!args) args = {};
+
+    if (args.namespace &amp;&amp; typeof args.namespace !== 'object') {
+        message = `${args.namespace}:${message}`;
+    } else {
+    }
+
+    //if we have params for translation like "Your IQ is {{iqnumber}}"
+    if (args.parameters) {
+        console.info("translation test",
+            i18next.t("Current balance is", {balance: "2000", currency: "AED", lng: this.language}));
+        message = i18next.t(message, {...args.parameters, lng: this.language});
+    } else {
+        message = i18next.t(message, {lng: this.language});
+        console.info("translated", message);
+    }
+
+    if (!args.mode) {
+        args.mode = {parse_mode: 'markdown'};
+    }
+
+    if(message === undefined) {
+        //something wrong with the translation
+        console.error("translation failed for user:", this,"message:",message,"args:",args);
+        return false;
+    }
+    message = "*" + message + "*";
+
+    console.info("UserSchema sendMessageToTelegram", message,args.mode);
+
+    return sendMessageToTelegram(this.telegramId, message
+        , args.mode);
+};
+
+/**
+ * Translates text and sends menu to telegram
+ * @param header
+ * @param menu
+ * @param namespace
+ * @returns {Promise&lt;*>}
+ */
+UserSchema.methods.sendMenu = async function (header, menu, namespace) {
+    console.info("UserSchema sendMenu got", header, menu, namespace);
+    //menu is an array of objects
+    //every array item is a line
+    //every array item's item is a column
+
+    if (namespace) {
+        header = `${namespace}:${header}`;
+    }
+    if (Array.isArray(menu) &amp;&amp; Array.isArray(menu[0])) {
+        menu.forEach(rowOfButtons => {
+            if (Array.isArray(rowOfButtons)) {
+                rowOfButtons.forEach(button => {
+                    Object.keys(button).forEach(buttonTitle => {
+                        //{ 'English': '/setLanguage English'}
+                        if(buttonTitle === '\u2063') return;
+                        //translate to user language
+                        console.info("translating button:",
+                            buttonTitle, "to language", this.language);
+                        console.info("result",
+                            i18next.t(buttonTitle, {lng: this.language}));
+                        // console.info(
+                        //     "Translations test:", i18next.t("Islamic Studies"));
+                        // console.info("bundle loaded?", i18next.hasResourceBundle(this.language,
+                        //         "default"));
+                        let buttonTitleTranslated = i18next.t(buttonTitle, {lng: this.language});
+                        if (buttonTitleTranslated !== buttonTitle) {
+                            button[buttonTitleTranslated] = button[buttonTitle];
+                            delete button[buttonTitle];
+                        }
+                        console.info("result button", button);
+                    });
+                });
+            }
+        });
+    }
+
+
+    return showArrayAsMenuInTelegram(this.telegramId,
+        i18next.t(header, {lng: this.language}),
+        menu);
+};
+
+
+export default mongoose.model('user', UserSchema);
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

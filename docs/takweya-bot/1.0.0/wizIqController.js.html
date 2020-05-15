@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: wizIqController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: wizIqController.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import axios from 'axios';
+import crypto from 'crypto';
+import querystring from 'querystring';
+import {parseString} from 'xml2js';
+
+// Define your Key (WizIQ)
+const access_key = process.env.WIZIQ_ACCESS_KEY;
+const secretAccessKey = process.env.WIZIQ_SECRET_KEY;
+const webServiceUrl = process.env.WIZIQ_API_URL;
+
+/**
+ * Parses xml string
+ * @param body
+ * @returns {Promise&lt;any>}
+ */
+const parsePromise = body => new Promise((resolve, reject) => {
+    parseString(body, (error, result) => {
+        if (error) {
+            reject(error);
+        } else {
+            resolve(result);
+        }
+    });
+});
+
+/**
+ * Generates timestamp
+ * @returns {number}
+ */
+function generateTimeStamp() {
+    console.info("generateTimeStamp called");
+    const date = new Date();
+    return Math.floor(date.getTime() / 1000);
+}
+
+/**
+ * Adds a student to WizIQ class
+ * @param student
+ * @param class_id
+ * @returns {Promise&lt;boolean|*>}
+ */
+async function addStudent(student, class_id) {
+    console.info("addStudent", student.profile.firstName, student.profile.lastName, student.email);
+    // `${student.profile.firstName} ${student.profile.lastName}`,
+    const studentName = student.profile.firstName + " " + student.profile.lastName;
+    const parameters = {
+        method: 'add_attendees',
+        class_id,
+        attendee_list: "&lt;attendee_list>\n" +
+            "  &lt;attendee>\n" +
+            `    &lt;attendee_id>&lt;![CDATA[${student.email}]]>&lt;/attendee_id>\n` +
+            `    &lt;screen_name>&lt;![CDATA[${studentName}]]>&lt;/screen_name>\n` +
+            `    &lt;language_culture_name>&lt;![CDATA[${student.language}]]>&lt;/language_culture_name>\n` +
+            "  &lt;/attendee>\n" +
+            "&lt;/attendee_list>"
+    };
+
+
+    //sample output from add_attendees WizIQ
+    // const res = {
+    //     "rsp": {
+    //         "$": {"status": "ok", "call_id": "00b499480995"},
+    //         "method": ["add_attendees"],
+    //         "add_attendees": [{
+    //             "$": {"status": "true"},
+    //             "class_id": ["1002164"],
+    //             "attendee_list": [{
+    //                 "attendee": [{
+    //                     "attendee_id": ["5d2c9584eb3f776f0a18b842"],
+    //                     "language_culture_name": ["en-us"],
+    //                     "attendee_url": ["https://backend.wiziqxt.com/landing/session/v1/aa5911ec129ba28e8d74b316a326e6a62899d20d339bdda0c0ace562d1fd5044/a?hash=MTAwMjE2NDphM2Q0YjcxNjE2ZGM1NDBlOTY3MzYzYTk4ZDE1ZTEyMzdjZGIyNDQ1ZDg5MjU3NmE="]
+    //                 }]
+    //             }]
+    //         }]
+    //     }
+    // };
+
+    const res = await callWizIq(parameters);
+
+    if (res &amp;&amp; typeof res === 'object' &amp;&amp; typeof res.rsp === 'object'
+        &amp;&amp; Array.isArray(res.rsp.add_attendees)
+        &amp;&amp; Array.isArray(res.rsp.add_attendees[0].attendee_list)
+        &amp;&amp; Array.isArray(res.rsp.add_attendees[0].attendee_list[0].attendee)
+        &amp;&amp; Array.isArray(res.rsp.add_attendees[0].attendee_list[0].attendee[0].attendee_url)
+        &amp;&amp; Array.isArray(res.rsp.add_attendees[0].attendee_list[0].attendee[0].attendee_id)
+        &amp;&amp; res.rsp.add_attendees[0].attendee_list[0].attendee[0].attendee_id[0] === student.email) {
+
+        return res.rsp.add_attendees[0].attendee_list[0].attendee[0].attendee_url[0];
+    }
+
+    return false;
+}
+
+/**
+ * Adds a teacher to WizIQ class
+ * @param teacher
+ * @returns {Promise&lt;boolean|number>}
+ */
+async function addTeacher(teacher) {
+    console.info("addTeacher", teacher.profile.firstName, teacher.profile.lastName, teacher.email);
+    const parameters = {
+        method: 'add_teacher',
+        name: `${teacher.profile.firstName} ${teacher.profile.lastName}`,
+        email: teacher.email,
+        password: Math.floor(Math.random() * 999999),
+    };
+
+    const res = await callWizIq(parameters);
+
+    if (!res) return false;
+
+    await saveWizIqTeacherIdToDb(teacher, res);
+
+    return parameters.password;
+}
+
+/**
+ * Saves WizIQ teacher id to database
+ * @param teacher
+ * @param res
+ * @returns {Promise&lt;boolean>}
+ */
+async function saveWizIqTeacherIdToDb(teacher, res) {
+    console.info('saveWizIqTeacherIdToDb', teacher.telegramId, res);
+    if (!res || !res.rsp || !res.rsp.add_teacher || !res.rsp.add_teacher[0]
+        || !res.rsp.add_teacher[0]['teacher_id']
+        || !res.rsp.add_teacher[0]['teacher_id'][0]) return false;
+
+    teacher.profile.wizIqId = res.rsp.add_teacher[0]['teacher_id'][0];
+
+    await teacher.profile.save();
+}
+
+/**
+ * Changes WizIQ teacher profile
+ * @param teacher_id
+ * @param firstName
+ * @param lastName
+ * @param email
+ * @returns {Promise&lt;boolean|number>}
+ */
+async function changeTeacher(teacher_id, firstName, lastName, email) {
+    console.info("changeTeacher", email);
+    const parameters = {
+        teacher_id,
+        name: `${firstName} ${lastName}`,
+        email,
+        can_schedule_class: 1,
+        method: 'edit_teacher',
+        is_active: 1,
+        password: Math.floor(Math.random() * 999999),
+    };
+
+    const res = await callWizIq(parameters);
+
+    if (!res) return false;
+
+    return parameters.password;
+}
+
+/**
+ * Creates a WizIQ class
+ * @param presenter_email
+ * @param language_culture_name
+ * @param title
+ * @param duration
+ * @returns {Promise&lt;{classId: *, url: *}|boolean|*>}
+ */
+async function createClass(presenter_email, language_culture_name, title, duration) {
+    console.info('createClass', presenter_email, language_culture_name, title);
+    let today = new Date();
+    today.setTime(today.getTime() + 1000);
+
+    let dd = today.getDate();
+
+    let mm = today.getMonth() + 1;
+    const yyyy = today.getFullYear();
+
+    const hh = today.getHours();
+
+    //start in 1 minute
+    const min = today.getMinutes();
+
+    if (dd &lt; 10) {
+        dd = '0' + dd;
+    }
+
+    if (mm &lt; 10) {
+        mm = '0' + mm;
+    }
+
+    const start_time = mm + '/' + dd + '/' + yyyy + ' ' + hh + ':' + min;
+
+    const parameters = {
+        method: 'create',
+        title,
+        start_time,
+        time_zone: 'Africa/Ouagadougou',
+        duration,
+        presenter_email,
+        language_culture_name,
+        attendee_limit: 1,
+        presenter_default_controls: 'audio, video',
+        attendee_default_controls: 'audio, video',
+        status_ping_url: process.env.WIZIQ_STATUS_URL
+    };
+
+    //we send the 'create' request to wizIQ and get a parsed reply object like
+    // const res = {
+    //     "rsp": {
+    //         "$": {"status": "ok", "call_id": "73b8c57c25ef"},
+    //         "method": ["create"],
+    //         "create": [{
+    //             "$": {"status": "true"},
+    //             "class_details": [{
+    //                 "class_master_id": ["1173849"],
+    //                 "class_id": ["1002164"],
+    //                 "recording_url": ["https://www.wiziqxt.com//class/recording.aspx?Gm7apshIUPnxCem0PpiwTYRTatEXrG4rSZYekOCcBuqOaOWcMT%2f%2bDYfZ1SLPVU2E0UkZL56Zcz79sR6vNr085w%3d%3d"],
+    //                 "presenter_list": [{
+    //                     "presenter": [{
+    //                         "presenter_email": ["test@email.com"],
+    //                         "presenter_url": ["https://backend.wiziqxt.com/landing/session/v1/1604579f63d6a06b077830af404845aadadaba35896ce6be1973f70d8dc9bcbe/p?hash=MTAwMjE2NDphNjE2NTljZTVjOTM3YTc0NjhiMzkzMWNkZWU3MWYyMzBlNWQxNGJhODY5Y2E4MWM="]
+    //                     }]
+    //                 }]
+    //             }]
+    //         }]
+    //     }
+    // };
+    const res = await callWizIq(parameters);
+
+    console.info("createClass res:", JSON.stringify(res));
+
+    if (res &amp;&amp; typeof res === 'object' &amp;&amp; typeof res.rsp === 'object') {
+        if (Array.isArray(res.rsp.create)
+            &amp;&amp; Array.isArray(res.rsp.create[0].class_details)
+            &amp;&amp; Array.isArray(res.rsp.create[0].class_details[0].presenter_list)
+            &amp;&amp; Array.isArray(res.rsp.create[0].class_details[0].presenter_list[0].presenter)
+            &amp;&amp; Array.isArray(res.rsp.create[0].class_details[0].presenter_list[0].presenter[0].presenter_url)) {
+            return {
+                classId: res.rsp.create[0].class_details[0].class_id[0],
+                url: res.rsp.create[0].class_details[0].presenter_list[0].presenter[0].presenter_url[0]
+            };
+        } else if(res.rsp.error) {
+            return res.rsp.error[0]["$"];
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Changes existing class parameters
+ * @returns {Promise&lt;boolean|*>}
+ */
+async function changeClass({fsm}, data) {
+    console.info('changeClass');
+    const class_id = data;
+    let today = new Date();
+    today.setTime(today.getTime() + (2 * 60 * 1000));
+
+    let dd = today.getDate();
+
+    let mm = today.getMonth() + 1;
+    const yyyy = today.getFullYear();
+
+    const hh = today.getHours();
+
+    //start in 1 minute
+    const min = today.getMinutes();
+
+    if (dd &lt; 10) {
+        dd = '0' + dd;
+    }
+
+    if (mm &lt; 10) {
+        mm = '0' + mm;
+    }
+
+    const start_time = mm + '/' + dd + '/' + yyyy + ' ' + hh + ':' + min;
+
+    const parameters = {
+        method: 'modify',
+        class_id,
+        start_time,
+        time_zone: 'Africa/Ouagadougou'
+    };
+
+    return callWizIq(parameters);
+}
+
+/**
+ * Creates encryption signature for WizIQ
+ * @param requestParameters
+ * @returns {*}
+ */
+function createSignature(requestParameters) {
+    console.info("createSignature",
+        requestParameters);
+    let signatureBase = "";
+    const encodedSecretAccessKey = encodeURIComponent(secretAccessKey);
+    console.info("createSignature encodedSecretAccessKey",
+        encodedSecretAccessKey);
+
+    Object.keys(requestParameters).forEach(key => {
+        if (signatureBase.length > 0)
+            signatureBase += "&amp;";
+        signatureBase += `${key}=${requestParameters[key]}`;
+    });
+    console.info("createSignature signatureBase",
+        signatureBase);
+
+
+    let hmac = crypto.createHmac('sha1', encodedSecretAccessKey);
+    hmac.write(signatureBase); // write in to the stream
+    hmac.end();       // can't read from the stream until you call end()
+    return hmac.read().toString('base64');    // read out hmac digest
+}
+
+/**
+ * Sends a post request to WizIQ
+ * @param requestParameters
+ * @returns {Promise&lt;boolean>}
+ */
+async function callWizIq(requestParameters) {
+    console.info("callWizIq", requestParameters);
+
+    // define method to call ,timestamp and generated signature
+    const timestamp = generateTimeStamp();
+
+    const data = {
+        access_key: access_key,
+        timestamp,
+        method: requestParameters.method,
+    };
+
+    data.signature = createSignature(data);
+
+    const url
+        // = 'xxx';
+        = webServiceUrl + '?method=' + data.method;
+
+
+    console.info("callWizIq posting", "data:", data, "requestParameters:", requestParameters);
+
+    const res = await axios.post(url, querystring.stringify({...data, ...requestParameters}));
+
+    let result = false;
+
+    console.info("callWizIq", res);
+
+    if (res &amp;&amp; res.data) {
+        try {
+            result = await parsePromise(res.data);
+        } catch (e) {
+            return false;
+        }
+        console.info("callWizIq got reply", JSON.stringify(result));
+    }
+
+    return result;
+}
+
+/**
+ * Parses WizIQ reports for student spent times on class
+ * @param report
+ * @returns {*}
+ */
+function getStudentsTimesFromReport(report) {
+    console.info("getStudentsTimesFromReport", report);
+    if (report.hasOwnProperty('attendance_report') &amp;&amp; typeof report.attendance_report.attendee_list === 'object'
+        &amp;&amp; typeof report.attendance_report.attendee_list[0].attendee === 'object') {
+
+        return report.attendance_report.attendee_list[0].attendee
+        //exclude teacher time
+            .filter(student => !(student['$'] &amp;&amp; student['$'].presenter))
+            .map(student => {
+                console.info(student.attendee_id[0], " => ", student.attended_minutes[0]);
+                // if (Number(student.attended_minutes[0])) {
+                    return {studentId: student.attendee_id[0], spentMinutes: student.attended_minutes[0]};
+                // }
+            });
+    }
+}
+
+/**
+ * Gets class report from WizIQ event
+ * @param event
+ * @returns {*}
+ */
+function getClassXMLreportFromEvent(event) {
+    let splitBody;
+    if (event.headers.hasOwnProperty('Content-Type') &amp;&amp; event.headers['Content-Type'].indexOf('boundary=') > -1) {
+        let boundaryIndex = event.headers["Content-Type"].indexOf("boundary=");
+        let boundary = event.headers["Content-Type"].slice(boundaryIndex + "boundary=".length);
+        // var parts = event.headers['Content-Type'].split('boundary=');
+        // var boundary = parts[1];
+        splitBody = event.body.split(boundary);
+        splitBody.forEach(function (message) {
+            if (!message) return;
+            const indexOfReport = message.indexOf('&lt;attendance_report>');
+            if (indexOfReport >= 0) {
+                const indexOfCloseReport = message.indexOf('&lt;/attendance_report>');
+                splitBody = message.slice(indexOfReport, indexOfCloseReport + '&lt;/attendance_report>'.length);
+            }
+        });
+    }
+    return splitBody;
+}
+
+/**
+ * Parses WizIQ event
+ * @param event
+ * @returns {Promise&lt;{payload: {classId: *, students: *}, action: string, telegramId: (*|Mongoose.Types.ObjectId|studentId|{ref, type, required}|string)}|boolean>}
+ */
+async function parseWizIqEvent(event) {
+    let xmlReport;
+
+    try {
+        xmlReport = getClassXMLreportFromEvent(event);
+    } catch (e) {
+        return false;
+    }
+
+    console.info("xmlReport", xmlReport);
+    if (!xmlReport) return false;
+
+    let reportObject;
+
+    try {
+        reportObject = await parsePromise(xmlReport);
+    } catch (e) {
+        return false;
+    }
+
+    if (!reportObject)  return false;
+    console.info("reportObject", JSON.stringify(reportObject));
+
+    const arrayOfStudentMinutes = getStudentsTimesFromReport(reportObject);
+
+    console.info("Got arrayOfStudentMinutes", arrayOfStudentMinutes);
+
+    if(!arrayOfStudentMinutes || arrayOfStudentMinutes[0] === undefined) return false;
+    //set to format for state machines
+    return {
+        telegramId: arrayOfStudentMinutes[0].studentId,
+        action: "setTheClassOver",
+        payload:
+            {
+                classId: reportObject.attendance_report.class_id[0],
+                students: arrayOfStudentMinutes
+            }
+    };
+}
+
+export {
+    addTeacher,
+    addStudent,
+    changeTeacher,
+    createClass,
+    parseWizIqEvent,
+    generateTimeStamp,
+    changeClass
+}
+
+//sample wiziq reports
+// let tmperr = {
+//     "rsp": {
+//         "$": {"status": "fail", "call_id": "31c54dec1f31"},
+//         "error": [{"$": {"code": "1064", "msg": "Teacher Email ID already exists."}}]
+//     }
+// };
+//
+// let tmpok = {
+//     "rsp": {
+//         "$": {"status": "ok", "call_id": "32d4529677db"},
+//         "method": ["add_teacher"],
+//         "add_teacher": [{"$": {"status": "true"}, "teacher_id": ["252275"], "teacher_email": ["some@email.ddd"]}]
+//     }
+// }
+// const addteacher = {
+//     "rsp": {
+//         "$": {"status": "ok", "call_id": "b77e216770d7"},
+//         "method": ["add_teacher"],
+//         "add_teacher": [{"$": {"status": "true"}, "teacher_id": ["252358"], "teacher_email": ["test@email.com"]}]
+//     }
+// }
+// const classadded = {
+//     "rsp": {
+//         "$": {"status": "ok", "call_id": "ff51e2d3a263"},
+//         "method": ["create"],
+//         "create": [{
+//             "$": {"status": "true"},
+//             "class_details": [{
+//                 "class_master_id": ["1173807"],
+//                 "class_id": ["1002126"],
+//                 "recording_url": ["https://www.wiziqxt.com//class/recording.aspx?Gm7apshIUPnxCem0PpiwTW48l35fhLeYSbn16MJ1%2bd95FeSJj2fQRj4gFoIpZrpvtv64s%2bdOpzcGdO%2fumhbv2w%3d%3d"],
+//                 "presenter_list": [{
+//                     "presenter": [{
+//                         "presenter_email": ["test@email.com"],
+//                         "presenter_url": ["https://backend.wiziqxt.com/landing/session/v1/b7a46a6c5e6d02adeae37500f6e53e9bcb8a9b8e9b9031d1081d13b56b7dc6c5/p?hash=MTAwMjEyNjo0MzIxODBlNTgxZDQxMGZkY2Q2ODAzZmRmMzE3ZjE4NmNlZmRlZWQ0ZDlmZjRjYmQ="]
+//                     }]
+//                 }]
+//             }]
+//         }]
+//     }
+// };
+// const studentadded = {
+//     "rsp": {
+//         "$": {"status": "ok", "call_id": "d0b1f26e3790"},
+//         "method": ["add_attendees"],
+//         "add_attendees": [{
+//             "$": {"status": "true"},
+//             "class_id": ["1002126"],
+//             "attendee_list": [{
+//                 "attendee": [{
+//                     "attendee_id": ["101"],
+//                     "language_culture_name": ["en-us"],
+//                     "attendee_url": ["https://backend.wiziqxt.com/landing/session/v1/e13b75e6f52d69ddf6b5012efb33022477730040f29100f2d7f485468f5240df/a?hash=MTAwMjEyNjo1MGFjOGNiYjRjZmE2ZDQzYzVkMWVhN2Q1NjA5OWY3NzgyZDg4OWZiNjRmZGIzMTc="]
+//                 }]
+//             }]
+//         }]
+//     }
+// }
+// POST / HTTP/1.1
+// Content-Type: multipart/form-data; boundary=---------------------------8d7105a08f43232
+// Host: 37.252.121.221:8888
+// X-NewRelic-ID: UwQFV19aGwoBXVZTAQIE
+// X-NewRelic-Transaction: PxRzI1cnfXUBUVlXBwhyU1YTGlUDChAHHEB8IAl8cXQCUAFUAVh2V1YUG0NeBg4BVFECWhVs
+// Content-Length: 1201
+// Expect: 100-continue
+// Connection: Keep-Alive
+//
+//
+// -----------------------------8d7105a08f43232
+// Content-Disposition: form-data; name="class_id"
+//
+// 1002126
+// -----------------------------8d7105a08f43232
+// Content-Disposition: form-data; name="class_status"
+//
+// completed
+// -----------------------------8d7105a08f43232
+// Content-Disposition: form-data; name="attendance_report_status"
+//
+// available
+// -----------------------------8d7105a08f43232
+// Content-Disposition: form-data; name="file0"; filename="636995851179536946_.xml"
+// Content-Type: application/octet-stream
+//
+// &lt;attendance_report>&lt;class_id>1002126&lt;/class_id>&lt;class_duration>9&lt;/class_duration>&lt;attendee_list>&lt;attendee presenter="true">&lt;attendee_id>&lt;![CDATA[test@email.com]]>&lt;/attendee_id>&lt;screen_name>&lt;![CDATA[Test Testoff]]>&lt;/screen_name>&lt;entry_time>7/25/2019 2:00:48 AM&lt;/entry_time>&lt;exit_time>7/25/2019 2:10:57 AM&lt;/exit_time>&lt;attended_minutes>9&lt;/attended_minutes>&lt;/attendee>&lt;attendee>&lt;attendee_id>&lt;![CDATA[101]]>&lt;/attendee_id>&lt;screen_name>&lt;![CDATA[Attendee1]]>&lt;/screen_name>&lt;entry_time>7/25/2019 2:09:26 AM&lt;/entry_time>&lt;exit_time>7/25/2019 2:11:21 AM&lt;/exit_time>&lt;attended_minutes>2&lt;/attended_minutes>&lt;/attendee>&lt;/attendee_list>&lt;/attendance_report>
+// -----------------------------8d7105a08f43232--
+//
+/*
+&lt;attendance_report>
+    &lt;class_id>1002126&lt;/class_id>
+    &lt;class_duration>9&lt;/class_duration>
+    &lt;attendee_list>
+        &lt;attendee presenter="true">
+            &lt;attendee_id>
+                &lt;![CDATA[test@email.com]]>
+            &lt;/attendee_id>
+            &lt;screen_name>
+                &lt;![CDATA[Test Testoff]]>
+            &lt;/screen_name>
+            &lt;entry_time>7/25/2019 2:00:48 AM&lt;/entry_time>
+            &lt;exit_time>7/25/2019 2:10:57 AM&lt;/exit_time>
+            &lt;attended_minutes>9&lt;/attended_minutes>
+        &lt;/attendee>
+        &lt;attendee>
+            &lt;attendee_id>
+                &lt;![CDATA[101]]>
+            &lt;/attendee_id>
+            &lt;screen_name>
+                &lt;![CDATA[Attendee1]]>
+            &lt;/screen_name>
+            &lt;entry_time>7/25/2019 2:09:26 AM&lt;/entry_time>
+            &lt;exit_time>7/25/2019 2:11:21 AM&lt;/exit_time>
+            &lt;attended_minutes>2&lt;/attended_minutes>
+        &lt;/attendee>
+    &lt;/attendee_list>
+&lt;/attendance_report>
+ */
+//
+// const parsedresult = {
+//     "attendance_report": {
+//         "class_id": ["1002126"],
+//         "class_duration": ["9"],
+//         "attendee_list": [{
+//             "attendee": [{
+//                 "$": {"presenter": "true"},
+//                 "attendee_id": ["test@email.com"],
+//                 "screen_name": ["Test Testoff"],
+//                 "entry_time": ["7/25/2019 2:00:48 AM"],
+//                 "exit_time": ["7/25/2019 2:10:57 AM"],
+//                 "attended_minutes": ["9"]
+//             }, {
+//                 "attendee_id": ["101"],
+//                 "screen_name": ["Attendee1"],
+//                 "entry_time": ["7/25/2019 2:09:26 AM"],
+//                 "exit_time": ["7/25/2019 2:11:21 AM"],
+//                 "attended_minutes": ["2"]
+//             }]
+//         }]
+//     }
+// }
+
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

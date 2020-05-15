@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: userQuestionsController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: userQuestionsController.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import {sendTopicsToChooseFrom} from './signUpController';
+import {getTopicsFromDbExcluding} from './accountController';
+import {Picture, Question, Subscription, Topic} from './dbModels';
+import {validateUserData} from "./verificationController";
+import {prepareQuestionsList, sendQuestionToTeacher} from "./subscriptionsController";
+import {deleteLastMessagesFromTelegram} from './telegramController';
+
+const namespace =  'default';
+
+/**
+ * addOnlineTeachersForEveryTopic
+ * @param topicObjs
+ * @param user
+ * @returns {Promise&lt;*>}
+ */
+const addOnlineTeachersForEveryTopic = async (topicObjs, user) => {
+    console.info("addOnlineTeachersForEveryTopic");
+
+    const onlineTranslated = user.translate('Online');
+
+    //list all subscriptions
+    const subscriptions = await Subscription.find({}).exec();
+    //topicId, [teachers]
+    const topicsWithTeachers = {};
+    for (let i in subscriptions) {
+        let numberOfTeachersOnline = 0;
+        subscriptions[i].teachers.forEach(teacher => {
+            if (teacher.busy) return;
+            numberOfTeachersOnline++;
+        });
+
+        topicsWithTeachers[subscriptions[i].topicId] = numberOfTeachersOnline;
+    }
+
+    console.info('addOnlineTeachersForEveryTopic topicsWithTeachers',topicsWithTeachers);
+
+    for (let i in topicObjs) {
+        //{ _id: 5d2c73f2eb3f776f0a18b841, name: 'Biology' }
+        if (topicsWithTeachers[topicObjs[i]._id] > 0) {
+            topicObjs[i].name = `${topicObjs[i].name} (${topicsWithTeachers[topicObjs[i]._id]} ${onlineTranslated})`;
+        } else {
+            topicObjs[i].name = `${topicObjs[i].name} (0 ${onlineTranslated})`;
+        }
+    }
+
+    console.info("addOnlineTeachersForEveryTopic ready", topicObjs);
+    return topicObjs;
+};
+
+/**
+ * translateAllTopics
+ * @param user
+ * @param topicObjs
+ * @returns {*}
+ */
+const translateAllTopics = (user, topicObjs) => {
+    for (let i in topicObjs) {
+        topicObjs[i].name = user.translate(topicObjs[i].name);
+    }
+
+    return topicObjs;
+};
+
+/**
+ * requestQuestionTopic
+ * @param fsm
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const requestQuestionTopic = async ({fsm, transition}, data) => {
+    console.info("requestQuestionTopic" &amp;&amp; data !== 'Warning');
+    if (transition === 'goto') return true;
+
+    const topicObjs = await getTopicsFromDbExcluding();
+
+    await translateAllTopics(fsm.user, topicObjs);
+
+    await addOnlineTeachersForEveryTopic(topicObjs, fsm.user);
+
+    if (topicObjs) {
+        await sendTopicsToChooseFrom(fsm.user, topicObjs,
+            {noConfirmButton: true}, {cancelButton: true});
+    }
+
+    console.info("requestQuestionTopic ended");
+    return true;
+};
+
+/**
+ * saveQuestionTopic
+ * @param fsm
+ * @param transition
+ * @param topicId
+ * @returns {Promise&lt;boolean>}
+ */
+const saveQuestionTopic = async ({fsm, transition}, topicId) => {
+    console.info("saveQuestionTopic", topicId);
+
+    //need to change topics menu actions to topic id!!!
+    const topic = await Topic.findById(topicId).exec();
+    if (!topic) return false;
+
+    await deleteLastMessagesFromTelegram(fsm.user);
+
+    console.info("saveQuestionTopic got topic", topic.name);
+    await fsm.user.say('You have selected');
+    await fsm.user.say(topic.name);
+
+    fsm.user.profile.lastQuestion = new Question({studentId: fsm.user._id});
+    fsm.user.profile.lastQuestion.topic = topic;
+    console.info("Created new question", fsm.user.profile.lastQuestion);
+    await fsm.user.profile.lastQuestion.save();
+    await fsm.user.profile.save();
+    console.info("fsm.user:", fsm.user);
+    console.info("fsm.user.profile:", fsm.user.profile);
+    console.info("fsm.user.profile.lastQuestion:", fsm.user.profile.lastQuestion);
+    return true;
+};
+
+/**
+ * requestQuestionText
+ * @param fsm
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const requestQuestionText = async ({fsm, transition}) => {
+    console.info("requestQuestionText");
+    if (transition === 'goto') return true;
+
+    await fsm.user.sendMenu("Please describe what do you need to help with", [[{"Go back": "/cancelQuestion"}]]);
+};
+
+/**
+ * saveQuestionText
+ * @param from
+ * @param fsm
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const saveQuestionText = async ({from, fsm, transition}, data) => {
+    console.info("saveQuestionText", data);
+    if (transition === 'cancelQuestion') return;
+
+    const failedValidation = await validateUserData(from, data, fsm.user);
+
+    if (failedValidation) {
+        fsm.transitionState = false;
+        return false;
+    }
+
+    fsm.user.profile.lastQuestion.text = data;
+
+    try {
+        await fsm.user.profile.lastQuestion.save();
+    } catch (err) {
+        console.error("lastQuestion.save", err.message);
+        return false;
+    }
+    console.info("fsm.user:", fsm.user);
+    console.info("fsm.user.profile:", fsm.user.profile);
+    console.info("fsm.user.profile.lastQuestion:", fsm.user.profile.lastQuestion);
+};
+
+/**
+ * requestQuestionPictures
+ * @param fsm
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const requestQuestionPictures = async ({fsm, transition}, data) => {
+    console.info("requestQuestionPictures");
+    if (transition === 'goto' &amp;&amp; data !== 'Warning') return true;
+    // const buttonText = fsm.user.translate('Finish');
+    await fsm.user.sendMenu("You can add pictures to your question, click Finish when done",
+        {"Go back": "/cancelQuestion", "Finish": "Finish"});
+    // {
+    //     namespace,
+    //     mode: {
+    //         parse_mode: 'markdown',
+    //         reply_markup: JSON.stringify({
+    //             keyboard: [
+    //                 [buttonText]
+    //             ],
+    //             resize_keyboard: true
+    //         })
+    //     }
+    // });
+};
+
+/**
+ * saveQuestionPictures
+ * @param fsm
+ * @param from
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const saveQuestionPictures = async ({fsm, from, transition}, data) => {
+    console.info("saveQuestionPictures");
+
+    if (transition === 'goto') return true;
+    if (transition === 'cancelQuestion') return;
+    if (data === fsm.user.translate('Finish')) {
+        console.info("Got finish from user");
+        await fsm.user.say('Finished uploading', {
+            namespace, mode:
+                {
+                    parse_mode: 'markdown',
+                    reply_markup: JSON.stringify({
+                        keyboard: [],
+                        remove_keyboard: true
+                    })
+                }
+        });
+        return true;
+    }
+
+    const failedValidation = await validateUserData(from, data, fsm.user);
+
+    if (failedValidation) {
+        fsm.transitionState = false;
+        return false;
+    } else {
+        let questionPicture = new Picture({data: data.fileId, contentType: 'telegram'});
+        if (!fsm.user.profile.lastQuestion.populated('pictures')) {
+            await fsm.user.profile.lastQuestion.populate('pictures').execPopulate();
+        }
+
+        fsm.user.profile.lastQuestion.pictures.addToSet(questionPicture);
+        await fsm.user.profile.lastQuestion.save();
+        await questionPicture.save();
+        console.info("saveQuestionPictures fsm.user:", fsm.user);
+        console.info("saveQuestionPictures fsm.user.profile:", fsm.user.profile);
+        console.info("saveQuestionPictures fsm.user.profile.lastQuestion:", fsm.user.profile.lastQuestion);
+        console.info("saveQuestionPictures questionPicture:", questionPicture);
+        await fsm.user.sendMenu('Picture received',
+            [[{"Finish": "Finish"}]]);
+    }
+
+    fsm.transitionState = false;
+    return false;
+};
+
+/**
+ * confirmQuestion
+ * @param fsm
+ * @param transition
+ * @param data
+ * @returns {Promise&lt;boolean>}
+ */
+const confirmQuestion = async ({fsm, transition}) => {
+    console.info("confirmQuestion");
+    if (transition === 'goto') return true;
+    const confirmText = "Send the request";
+    const cancelText = "Cancel";
+
+    const confirmOrCancelMenu = {};
+    confirmOrCancelMenu[confirmText] = "/sendQuestion";
+    confirmOrCancelMenu[cancelText] = "/cancelQuestion";
+
+    const sentMessage = await fsm.user.sendMenu("Ready to send?",
+        confirmOrCancelMenu, namespace);
+
+    if (sentMessage &amp;&amp; sentMessage.message_id) {
+        console.info("confirmQuestion saved messageid", sentMessage.message_id);
+        fsm.user.messageCache.push(sentMessage.message_id);
+    }
+};
+
+/**
+ * sendQuestion
+ * @param fsm
+ * @returns {Promise&lt;boolean>}
+ */
+const sendQuestion = async ({fsm}) => {
+    //check for minimal balance
+    console.info("sendQuestion");
+    console.info("sendQuestion fsm.user.accountBalance", fsm.user.accountBalance);
+
+    await deleteLastMessagesFromTelegram(fsm.user);
+
+    if (fsm.user.accountBalance.balance &lt; 100) {
+        await fsm.user.say('Insufficient funds to submit');
+        await fsm.user.say('Current balance is', {
+            parameters: {
+                balance: fsm.user.accountBalance.balance,
+                currency: fsm.user.accountBalance.currency
+            }
+        });
+        await cancelQuestion({fsm});
+        return true;
+    } else {
+        //if ok - send
+        await fsm.user.profile.questions.addToSet(fsm.user.profile.lastQuestion);
+        await fsm.user.profile.save();
+
+        const res = await sendQuestionToTeachers(fsm.user);
+
+        if (!res) {
+            await cancelQuestion({fsm});
+            return true;
+        }
+
+        await fsm.user.say('Question sent ✈️');
+        await fsm.user.say('Current balance is', {
+            parameters: {
+                balance: fsm.user.accountBalance.balance,
+                currency: fsm.user.accountBalance.currency
+            }
+        });
+
+        return true;
+    }
+};
+
+/**
+ * sendQuestionToTeachers
+ * @param student
+ * @returns {Promise&lt;boolean>}
+ */
+const sendQuestionToTeachers = async (student) => {
+    if (!student.populated('lastQuestion')) {
+        await student.populate('lastQuestion').execPopulate();
+    }
+
+    if (student.profile.lastQuestion.pictures.length &amp;&amp; !student.profile.lastQuestion.populated('pictures')) {
+        await student.profile.lastQuestion.populate('pictures').execPopulate();
+    }
+
+    console.info("sendQuestionToTeachers", JSON.stringify(student));
+
+    const subscription = await Subscription.findOne({topicId: student.profile.lastQuestion.topic}).exec();
+
+    console.info("sendQuestionToTeachers got subscription with the list of teacher IDs", JSON.stringify(subscription));
+
+    if (!subscription || !subscription.teachers.length) {
+        console.info("sendQuestionToTeachers subscribed teachers not found for",
+            student.profile.lastQuestion.topic);
+        await student.say("Sorry - no teachers currently online on this topic. But the question was saved.");
+        return true;
+    }
+
+    const formattedList = prepareQuestionsList([student.profile.lastQuestion]);
+
+    let sendArr = subscription.teachers.map(teacher => {
+        console.info("sendQuestionToTeachers sending question", student.profile.lastQuestion, "to teacher", teacher);
+        if(teacher) return sendQuestionToTeacher(formattedList[0], teacher.toString());
+    });
+
+    await Promise.all(sendArr);
+
+    console.info("sendQuestionToTeachers all sent");
+    return true;
+};
+
+/**
+ * cancelQuestion
+ * @param fsm
+ * @returns {Promise&lt;boolean>}
+ */
+const cancelQuestion = async ({fsm}) => {
+    console.info("cancelQuestion");
+    console.info("cancelQuestion fsm.user:", fsm.user);
+    console.info("cancelQuestion fsm.user.profile:", fsm.user.profile);
+    console.info("cancelQuestion fsm.user.profile.lastQuestion:", fsm.user.profile.lastQuestion);
+    if (typeof fsm.user.profile.lastQuestion === 'object'
+        &amp;&amp; fsm.user.profile.lastQuestion !== null
+        &amp;&amp; typeof fsm.user.profile.lastQuestion.remove === 'function') {
+        await fsm.user.profile.lastQuestion.remove();
+        await fsm.user.say('Deleted question');
+    }
+    await fsm.user.say('Cancelled');
+    return true;
+};
+
+/**
+ * listActiveQuestionsToTopic
+ * @param topicId
+ * @param notEarlierThanMinutes
+ * @returns {Promise&lt;*>}
+ */
+const listActiveQuestionsToTopic = async (topicId, notEarlierThanMinutes) => {
+    console.info("listActiveQuestionsToTopic", topicId, notEarlierThanMinutes);
+    let questions;
+    if (notEarlierThanMinutes) {
+        let dateNowMinus;
+        dateNowMinus = new Date();
+        dateNowMinus.setTime(dateNowMinus.getTime() - notEarlierThanMinutes * 60000);
+        console.info("listActiveQuestionsToTopic gte", dateNowMinus);
+        questions = await Question.find({
+            topic: topicId,
+            createdAt: {$gte: dateNowMinus}
+        }).populate('pictures documents').exec();
+    } else {
+        questions = await Question.find({topic: topicId}).populate('pictures documents').exec();
+    }
+
+    //remove all questions without question
+    questions = questions.filter(function (question) {
+        return question.text != null;
+    });
+
+    console.info("listActiveQuestionsToTopic found questions", questions);
+    return questions;
+};
+
+export {
+    requestQuestionTopic,
+    saveQuestionTopic,
+    requestQuestionText,
+    saveQuestionText,
+    requestQuestionPictures,
+    saveQuestionPictures,
+    confirmQuestion,
+    sendQuestion,
+    cancelQuestion,
+    listActiveQuestionsToTopic
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

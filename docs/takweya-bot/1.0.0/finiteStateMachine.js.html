@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: finiteStateMachine.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: finiteStateMachine.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>'use strict';
+import {saveUserState, getUserAndStates, clearUser} from './accountController';
+import MachineFactories from './stateMachines/MachineFactories';
+import {sendMessageToTelegram} from "./telegramController";
+import {User, LambdaContainer} from './dbModels';
+import {subscribeToTopic} from "./subscriptionsController";
+
+//this object for machines storing is accessible within one AWS Lambda container => can drop at any moment
+const machines = {};
+
+const namespace =  'default';
+
+/**
+ * Checks if user submachine state is present
+ * @param user
+ * @returns {boolean|*|subMachine|{type}}
+ */
+function checkUsersubMachine(user) {
+    //if there's an empty subState then it will wreck everything
+    if (user.state &amp;&amp; user.state.subState) {
+        return user.state.subMachine;
+    }
+
+    return false;
+}
+
+/**
+ * Creates submachine if needed
+ * @param user
+ * @param subMachine
+ * @returns {*}
+ */
+function recreateSubMachine(user, subMachine) {
+    const telegramId = user.telegramId;
+    if (subMachine &amp;&amp; user.state.subState) {
+        console.info("recreateSubMachine got subMachine", subMachine, "for", user);
+        machines[telegramId].activeMachine = subMachine;
+        machines[telegramId][subMachine] = new MachineFactories[subMachine](user);
+        console.info("recreateSubMachine created subMachine", subMachine, "for", user);
+        return subMachine;
+    } else {
+        machines[telegramId].activeMachine = "MainMachine";
+    }
+}
+
+/**
+ * Checks current lambda container id
+ * to see if we can reuse existing memory data
+ * @returns {Promise&lt;*|string>}
+ */
+async function checkForExistingLambdaContainer(telegramId) {
+    console.info("checkForExistingLambdaContainer");
+    //but user can run this action after another lambda container
+    //so unfortunately we must check if container haven't changed...
+    //and all we got is telegramId...
+
+    const container = await LambdaContainer.findOneAndUpdate({telegramId}, {$set: {"containerId": global.uuid}},
+        {upsert: true})
+        .select('-_id containerId')
+        .exec();
+    console.info("checkForExistingLambdaContainer checking uuid old", container, 'new', global.uuid);
+    if (container === null
+        || container.containerId === global.uuid) {
+        //container not changed - ok
+        return true;
+    }
+}
+
+/**
+ * Checks for current lambda container and existing data
+ * gets user data and state checks his submachine and
+ * recreates it if needed
+ * @param telegramId
+ * @param startingMachineState
+ * @param event
+ * @returns {Promise&lt;*|string|string|*|string>}
+ */
+async function findOrCreateAStateMachineForTheUser(telegramId, startingMachineState, event) {
+    console.info("findOrCreateAStateMachineForTheUser", telegramId, startingMachineState);
+
+    if (machines[telegramId] &amp;&amp; machines[telegramId]['MainMachine']) {
+        console.info("findOrCreateAStateMachineForTheUser found existing machine", telegramId);
+        const containerNotChanged = await checkForExistingLambdaContainer(telegramId);
+        if (containerNotChanged) {
+            console.info("findOrCreateAStateMachineForTheUser container not changed", machines[telegramId].activeMachine);
+            return machines[telegramId].activeMachine;
+        }
+    }
+
+    console.info("findOrCreateAStateMachineForTheUser started", telegramId);
+    machines[telegramId] = {};
+
+    let {user, savedState} = await getUserAndStates(telegramId, event);
+
+    console.info("getUserAndStates, checking submachine");
+
+    //if user have a subMachine - use it instead of main
+    const subMachine = checkUsersubMachine(user);
+
+    console.info("findOrCreateAStateMachineForTheUser creating new MainMachine for", telegramId,
+        "user", user, "savedState", savedState, "subMachine", subMachine);
+
+    //creating new state machine
+    machines[telegramId]["MainMachine"] = new MachineFactories["MainMachine"](user);
+
+    console.info("findOrCreateAStateMachineForTheUser created MainMachine for", telegramId);
+
+    //if this is an existing user with subMachine
+    //we need to create it
+    recreateSubMachine(user, subMachine);
+
+    let currentMachineName = machines[telegramId].activeMachine;
+
+    //for tests
+    if (startingMachineState) {
+        savedState = startingMachineState;
+    }
+
+    //finally we need to move the machine to the saved user state
+    //to start the next action from it
+    if (savedState) {
+        console.info("findOrCreateAStateMachineForTheUser moving machine", currentMachineName,
+            "to", savedState, "for the User", telegramId);
+
+        //check if that state exists
+        if (machines[telegramId][currentMachineName].allStates().indexOf(savedState) >= 0) {
+            await machines[telegramId][currentMachineName].goto(savedState);
+        } else {
+            console.error("findOrCreateAStateMachineForTheUser moving machine", currentMachineName,
+                "to", savedState, "for the User", telegramId, "failed - no such state");
+            if (currentMachineName !== 'MainMachine') {
+                const mainMachine = finishSubmachine(machines[telegramId][currentMachineName], currentMachineName);
+                currentMachineName = 'MainMachine';
+                await mainMachine.goto(savedState);
+            }
+        }
+    }
+
+    console.info("findOrCreateAStateMachineForTheUser finished", user);
+    return currentMachineName;
+}
+
+/**
+ * Creates submachine for a user
+ * @param mainMachine
+ * @param subMachineName
+ * @param userMachines
+ * @returns {Promise&lt;boolean>}
+ */
+async function createSubMachineForUser(mainMachine, subMachineName, userMachines) {
+    console.info("createSubMachineForUser started for user", mainMachine.user);
+
+    userMachines[subMachineName] = new MachineFactories[subMachineName](mainMachine.user);
+    console.info("createSubMachineForUser ended for user", mainMachine.user);
+
+    userMachines.activeMachine = subMachineName;
+
+    console.info("starting subMachine", subMachineName);
+
+    const subResponse = await userMachines[subMachineName].start();
+    mainMachine.user.state.subMachine = subMachineName;
+    mainMachine.user.state.subState = userMachines[subMachineName].state;
+    console.info("started subMachine", subMachineName,
+        "state=>", userMachines[subMachineName].state, "subResponse", subResponse);
+
+    return true;
+}
+
+/**
+ * Resets the bot to starting state
+ * @param telegramId
+ * @returns {Promise&lt;*|string>}
+ */
+async function resetTheBotForUser(telegramId) {
+    console.info("resetTheBotForUser", telegramId,
+        machines[telegramId].activeMachine);
+
+    let currentMachine = machines[telegramId].activeMachine;
+    console.info("resetTheBotForUser machine:",
+        machines[telegramId][currentMachine]);
+
+    if (!currentMachine) {
+        currentMachine = machines[telegramId].activeMachine = 'MainMachine';
+    }
+
+    if (!machines[telegramId][currentMachine].user) {
+        console.error("User on the machine is null");
+        return false;
+    }
+
+    let userActiveStateMachine = machines[telegramId][currentMachine];
+
+    //erase user submachine state
+    if (userActiveStateMachine.user.state
+        &amp;&amp; userActiveStateMachine.user.state.subState) {
+        userActiveStateMachine = finishSubmachine(userActiveStateMachine, currentMachine);
+    }
+
+    userActiveStateMachine.goto('initial');
+    if (userActiveStateMachine.user.language) {
+        await userActiveStateMachine.user.say('`To start from language choosing write `*/start*\n' +
+            "`To completely erase user and start write `*/cleanstart*", {
+            namespace,
+            mode: {parse_mode: "markdown"}
+        });
+    } else {
+        await sendMessageToTelegram(userActiveStateMachine.user.telegramId,
+            "`To start from language choosing write `*/start*\n" +
+            "`DEBUG - To completely erase user and start write `*/cleanstart*",
+            {parse_mode: 'markdown'});
+        await sendMessageToTelegram(userActiveStateMachine.user.telegramId,
+            "*/start*` للبدء من اللغة اختيار الكتابة`\n" +
+            "`DEBUG - `*/cleanstart*` لمسح المستخدم تمامًا وبدء الكتابة`",
+            {parse_mode: 'markdown'});
+        await sendMessageToTelegram(userActiveStateMachine.user.telegramId,
+            "`Pour commencer à partir de la langue en choisissant write `*/start*\n" +
+            "`DEBUG - Pour effacer complètement l'utilisateur et commencer à écrire `*/cleanstart*",
+            {parse_mode: 'markdown'});
+    }
+    return machines[telegramId].activeMachine;
+}
+
+/**
+ * Finishes submachine
+ * @param userActiveStateMachine
+ * @param currentMachineName
+ * @returns {*}
+ */
+function finishSubmachine(userActiveStateMachine, currentMachineName) {
+    console.info("finishSubmachine", currentMachineName);
+    const telegramId = userActiveStateMachine.user.telegramId;
+    userActiveStateMachine.user.state.subMachine = undefined;
+    userActiveStateMachine.user.state.subState = undefined;
+    delete machines[telegramId][currentMachineName];
+    console.info("finishSubmachine", telegramId, 'deleted submachine',
+        currentMachineName,
+        machines[telegramId][currentMachineName]);
+
+    //and we must continue MainMachine.
+    machines[telegramId].activeMachine = "MainMachine";
+    return machines[telegramId]["MainMachine"];
+}
+
+/**
+ * Checks if it is a dev bot and who can access it
+ * @param telegramId
+ * @returns {Promise&lt;boolean>}
+ */
+async function itIsDevBot(telegramId) {
+    if (process.env.DEV_BOT) {
+        if (telegramId !== 141806604 &amp;&amp; telegramId !== 251375659 &amp;&amp;
+            telegramId !== parseInt(process.env.ADMIN_CHAT_ID)) {
+            await sendMessageToTelegram(telegramId,
+                "‼️This is a development bot.\n" +
+                "Please use @TakweyaHelpBot instead and don't forget " +
+                "to send /cleanstart to start the test over.\n" +
+                "Thank you.");
+            return true;
+        }
+    }
+}
+
+/**
+ * Makes a clean start for a user completely wipes him
+ * @param telegramId
+ * @returns {Promise&lt;string>}
+ */
+async function cleanStart(telegramId) {
+    let found;
+    try {
+        found = await clearUser(telegramId);
+    } catch (err) {
+        console.error("clearUser", err.message);
+    }
+
+    if (found) {
+        delete machines[telegramId];
+        await sendMessageToTelegram(telegramId,
+            '*OLD USER REMOVED*', {
+                parse_mode: 'markdown',
+                reply_markup: JSON.stringify({
+                    keyboard: [],
+                    remove_keyboard: true
+                })
+            });
+    }
+    return 'start';
+}
+
+/**
+ * Finds a user to end the class for
+ * @param telegramId
+ * @returns {Promise&lt;boolean|*>}
+ */
+async function setTheClassOver(telegramId) {
+    console.error("setTheClassOver", telegramId, typeof telegramId);
+
+    if (!telegramId) return false;
+
+    //it's wizIQ end class event
+    //meaning telegramId now set to student's email
+    //so we find student telegram id and move on.
+    //student machine goes to update accounts and rate teacher
+    const email = telegramId.toString();
+    const resObj = await User.findOne({email: {$regex: email, $options: "i"}})
+        .select('-_id telegramId')
+        .exec();
+    if (!resObj) {
+        console.error("setTheClassOver wizIq event telegramId not found for", email);
+        return false;
+    } else {
+        telegramId = resObj.telegramId;
+        console.error("setTheClassOver wizIq found telegramId", email, telegramId);
+    }
+    return telegramId;
+}
+
+/**
+ * Runs pre-state machine commands depending on current action
+ * @param telegramId
+ * @param action
+ * @param payload
+ * @returns {Promise&lt;{action: string, telegramId: number}|boolean>}
+ */
+async function processAction(telegramId, action, payload) {
+    console.info("processAction", telegramId, 'action:', action, 'payload:', payload);
+
+    switch (action) {
+        case 'cleanstart':
+            action = await cleanStart(telegramId);
+            break;
+        case 'setTheClassOver':
+            console.info("processAction setTheClassOver");
+            if (payload)
+                telegramId = await setTheClassOver(telegramId);
+            else
+                payload = {classId: 123, students: [{studentId: 'n@t.com', spentMinutes: '3'}]};
+            break;
+        default:
+            break;
+    }
+
+    if (!telegramId) return true;
+
+    if (await itIsDevBot(telegramId)) return true;
+
+    //if this is a command from the admin channel
+    if (telegramId === parseInt(process.env.ADMIN_CHAT_ID)) {
+        await processAdminCommand(action, payload);
+        return true;
+    }
+
+    if (typeof telegramId !== 'number') {
+        console.warn("telegramID is not a number", telegramId, typeof telegramId);
+        telegramId = parseInt(telegramId)
+    }
+
+    return {telegramId, action};
+}
+
+/**
+ * Checks if a submachine needs to be ended and ends it
+ * @param currentMachineName
+ * @param userActiveStateMachine
+ * @returns {Promise&lt;*>}
+ */
+async function finishSubmachineIfNeeded(currentMachineName, userActiveStateMachine) {
+    console.info("finishSubmachineIfNeeded", currentMachineName, "0");
+    let mainMachine;
+    //we were running a submachine for this iteration
+    switch (currentMachineName) {
+        case 'UserRegistrationMachine':
+            console.info("finishSubmachineIfNeeded", currentMachineName, "1", userActiveStateMachine.user.isRegistered);
+            if (userActiveStateMachine.user.isRegistered || userActiveStateMachine.state === 'finish') {
+                console.info("finishSubmachineIfNeeded", currentMachineName, "2");
+                mainMachine
+                    = finishSubmachine(userActiveStateMachine, currentMachineName);
+                await mainMachine.goto('user_registration');
+                await mainMachine['registered']();
+            }
+            break;
+        case 'UserQuestionMachine':
+            if (userActiveStateMachine.state === 'finished') {
+                mainMachine = finishSubmachine(userActiveStateMachine, currentMachineName);
+                //if the machine was rebuilt we need to move to saved state
+                if (mainMachine.state === 'initial') {
+                    await mainMachine.goto(mainMachine.user.state.state);
+                }
+
+                await mainMachine.goto('dashboard');
+            }
+            break;
+        default:
+            break;
+    }
+
+    return mainMachine;
+}
+
+/**
+ * Processes a new state and moves user's state machine with the provided action
+ * @param telegramId
+ * @param action
+ * @param payload
+ * @param startingMachineState
+ * @param event
+ * @returns {Promise&lt;boolean|*>}
+ */
+async function newStateAction({telegramId, action, payload, startingMachineState, event}) {
+    console.info("newStateAction", "telegramId", telegramId, "action", action,
+        "payload", payload, "startingMachineState", startingMachineState);
+
+    let currentMachineName
+        = await findOrCreateAStateMachineForTheUser(telegramId, startingMachineState, event);
+
+    if (!currentMachineName) {
+        console.error("currentMachineName undefined", telegramId);
+        return true;
+    } else {
+        console.info("currentMachineName is", currentMachineName);
+    }
+
+    if (!machines[telegramId][currentMachineName].user.state.state) {
+        //new user
+        action = 'start';
+    }
+
+    if (action === 'start') {
+        await sendMessageToTelegram(telegramId,
+            '*Starting...*', {parse_mode: 'markdown'});
+        currentMachineName = await resetTheBotForUser(telegramId);
+
+        if (currentMachineName === false) {
+            //something is wrong
+            console.error("currentMachineName undefined", telegramId);
+            return true;
+        }
+    }
+
+    let userActiveStateMachine = machines[telegramId][currentMachineName];
+
+    console.info("starting action:", action, "on",
+        currentMachineName, "from state",
+        userActiveStateMachine.state,
+        "payload", payload);
+
+    if (userActiveStateMachine.can(action) !== true) {
+        console.error("action", action, "is wrong on", currentMachineName, "for", telegramId);
+        //we got wrong action
+        await userActiveStateMachine.user.say(`You can't do ${action} from ${userActiveStateMachine.state}`);
+        await userActiveStateMachine.user.sendMenu(`Please choose again or go back`,
+            [[{'Go back': `/goBack`}]]
+        );
+        action = 'repeatAction';
+        payload = userActiveStateMachine.state;
+
+        //this is a necessary trick
+        //in order to fire the state again on the machine
+        //we need to change it first to something and then go back to it.
+        await userActiveStateMachine['goto']('repeatState');
+    }
+
+
+    //turn on transitions by default
+    //set to false if we need to stop transition
+    userActiveStateMachine.transitionState = true;
+
+    /////////////////////machine action
+    const res = await userActiveStateMachine[action](payload);
+    //////////////////////
+
+    console.info(currentMachineName, "ending state",
+        userActiveStateMachine.state, "res:", res, typeof res);
+
+    //if we got switchToSubmachine than we need to create it
+    if (res &amp;&amp; typeof res === 'object'
+        &amp;&amp; typeof res.switchToSubmachine === 'string') {
+        await createSubMachineForUser(userActiveStateMachine,
+            res.switchToSubmachine, machines[telegramId]);
+    }
+
+    if (currentMachineName !== 'MainMachine') {
+        const mainMachine = await finishSubmachineIfNeeded(currentMachineName, userActiveStateMachine);
+        if (mainMachine) {
+            userActiveStateMachine = mainMachine;
+            currentMachineName = 'MainMachine';
+        }
+    }
+
+    await saveUserState(userActiveStateMachine, currentMachineName);
+
+    return userActiveStateMachine;
+}
+
+/**
+ * Runs command for an action got from admin channel
+ * @param action
+ * @param payload
+ * @returns {Promise&lt;void>}
+ */
+async function processAdminCommand(action, payload) {
+    if (action === "verify") {
+        console.info("got verification command for", payload);
+        const user = await User.findById(payload)
+            .populate('profile').exec();
+        if (user) {
+            console.info("user to verify:", user);
+            if (user.isVerified) {
+                await sendMessageToTelegram(process.env.ADMIN_CHAT_ID,
+                    `User ${user.profile.firstName} ${user.profile.lastName} already verified`);
+            } else {
+                user.isVerified = true;
+
+                for (let i in user.availableToSubscribe) {
+                    await subscribeToTopic({fsm: {user}}, user.availableToSubscribe[i], {direct: true});
+                }
+                await user.save();
+                await user.say('Your account has been confirmed. You can login now');
+                await sendMessageToTelegram(process.env.ADMIN_CHAT_ID,
+                    `User ${user.profile.firstName} ${user.profile.lastName} verification complete`);
+            }
+        } else {
+            await sendMessageToTelegram(process.env.ADMIN_CHAT_ID,
+                `User NOT FOUND`);
+        }
+    }
+}
+
+/**
+ * Processes action and sends action to state machine
+ * @param args
+ * @returns {Promise&lt;boolean|Promise&lt;boolean|*>>}
+ */
+export default async (args) => {
+    //check for dev bot/admin chan command/wizIQ event
+    const result = await processAction(args.telegramId, args.action, args.payload);
+
+    if (result === true) return true;
+
+    args.telegramId = result.telegramId;
+    args.action = result.action;
+
+    return newStateAction(args);
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

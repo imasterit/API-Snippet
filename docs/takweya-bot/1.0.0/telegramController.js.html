@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: telegramController.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link href="styles/prettify-tomorrow.css" rel="stylesheet" type="text/css">
+    <link href="styles/jsdoc-default.css" rel="stylesheet" type="text/css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: telegramController.js</h1>
+
+
+
+
+
+
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import TelegramBot from 'node-telegram-bot-api';
+
+import {TELEGRAM_TOKEN} from '../config';
+
+// const proxy = "socks://127.0.0.1:1090";
+
+const bot = new TelegramBot(TELEGRAM_TOKEN, {
+    // request: {
+    //     proxy: 'http://127.0.0.1:1087'
+    // }
+});
+
+/**
+ * sendMessageToTelegram
+ * @param telegramId
+ * @param message
+ * @param format
+ * @returns {Promise&lt;*>}
+ */
+async function sendMessageToTelegram(telegramId, message, format) {
+    if (telegramId === undefined
+        || telegramId === false
+        || !message) return;
+    console.info("sendMessageToTelegram", telegramId, message);
+
+    let res;
+    try {
+        res = await bot.sendMessage(telegramId, message, format);
+    } catch (err) {
+        console.error("sendMessageToTelegram ERROR", err);
+        return err;
+    }
+
+    console.info("sendMessageToTelegram sent", res);
+    return res;
+}
+
+/**
+ * sendMediaGroupToTelegram
+ * @param telegramId
+ * @param media
+ * @param options
+ * @returns {Promise&lt;*>}
+ */
+async function sendMediaGroupToTelegram(telegramId, media, options) {
+    console.info("sendMediaGroupToTelegram", telegramId, JSON.stringify(media),
+        JSON.stringify(options));
+
+    let res;
+    try {
+        res = await bot.sendMediaGroup(telegramId, media, options);
+    } catch (err) {
+        console.error(err);
+        return err;
+    }
+
+    console.info("sendMediaGroupToTelegram sent", res);
+}
+
+/**
+ * sendPhotoToTelegram
+ * @param telegramId
+ * @param photoId
+ * @param options
+ * @returns {Promise&lt;*>}
+ */
+async function sendPhotoToTelegram(telegramId, photoId, options) {
+    console.info("sendPhotoToTelegram", telegramId, photoId);
+
+    let res;
+    try {
+        res = await bot.sendPhoto(telegramId, photoId, options);
+    } catch (err) {
+        console.error(err);
+        return err;
+    }
+
+    console.info("sendPhotoToTelegram sent", res);
+}
+
+/**
+ * formatArrayAsMenuForTelegram
+ * @param header
+ * @param arrayOfKeyValueToShow
+ * @param format
+ * @returns {any}
+ */
+function formatArrayAsMenuForTelegram(header, arrayOfKeyValueToShow, format) {
+    console.info("formatArrayAsMenuForTelegram", "header", header,
+        "arrayOfKeyValueToShow", arrayOfKeyValueToShow, "format", format);
+    // console.info("telegramId", telegramId, "header", header, "arrayOfKeyValueToShow", arrayOfKeyValueToShow,
+    //     "TELEGRAM_TOKEN", TELEGRAM_TOKEN, "bot", bot);
+    if (!arrayOfKeyValueToShow || typeof arrayOfKeyValueToShow !== 'object'
+        || !Object.keys(arrayOfKeyValueToShow).length) {
+        console.warn("formatArrayAsMenuForTelegram Wrong menu array to send", arrayOfKeyValueToShow);
+        return;
+    }
+
+    if (Array.isArray(arrayOfKeyValueToShow) &amp;&amp; Array.isArray(arrayOfKeyValueToShow[0])) {
+        arrayOfKeyValueToShow.forEach(rowOfButtons => {
+            if (Array.isArray(rowOfButtons)) {
+                rowOfButtons.forEach(button => {
+                    Object.keys(button).forEach(buttonTitle => {
+                        //{ 'English': '/setLanguage English'}
+                        button.text = buttonTitle;
+                        if (button[buttonTitle] &amp;&amp;
+                            button[buttonTitle].startsWith &amp;&amp;
+                            button[buttonTitle].startsWith('http')) {
+                            button.url = button[buttonTitle];
+                        } else {
+                            button.callback_data = button[buttonTitle];
+                        }
+                        delete button[buttonTitle];
+                    });
+                });
+            }
+        });
+        // Object.keys(arrayOfKeyValueToShow).forEach(menuItem => {
+        //     console.info("creating button for", menuItem);
+        //     markup.reply_markup.inline_keyboard.push(
+        //         [{text: menuItem, callback_data: arrayOfKeyValueToShow[menuItem]}]);
+        // });
+        console.info("formatArrayAsMenuForTelegram converted arr of arr", arrayOfKeyValueToShow);
+    } else {
+        //convert for telegram format
+        let menuArray = [];
+        Object.keys(arrayOfKeyValueToShow).forEach(key => {
+            menuArray.push([{text: key, callback_data: arrayOfKeyValueToShow[key]}]);
+        });
+        arrayOfKeyValueToShow = menuArray;
+        console.info("formatArrayAsMenuForTelegram converted arr", arrayOfKeyValueToShow);
+    }
+
+    if (!header || typeof header !== 'string') {
+        console.warn("formatArrayAsMenuForTelegram wrong header", header);
+        return;
+    }
+
+    const markup = Object.assign({},
+        {
+            reply_markup: {
+                inline_keyboard: [],
+            }
+        },
+        format);
+
+    markup.reply_markup.inline_keyboard = arrayOfKeyValueToShow;
+    markup.reply_markup.resize_keyboard = true;
+
+    // markup.reply_markup.resize_keyboard = true;
+    // markup.parse_mode = "markdown";
+    markup.caption = header;
+    // Object.keys(arrayOfKeyValueToShow).forEach(menuItem => {
+    //     console.info("creating button for", menuItem);
+    //     markup.reply_markup.inline_keyboard.push(
+    //         [{text: menuItem, callback_data: arrayOfKeyValueToShow[menuItem]}]);
+    // });
+
+    console.info("formatArrayAsMenuForTelegram markup", JSON.stringify(markup));
+    return markup;
+}
+
+/**
+ * showArrayAsMenuInTelegram
+ * @param telegramId
+ * @param header
+ * @param arrayOfKeyValueToShow
+ * @param format
+ * @returns {Promise&lt;*>}
+ */
+async function showArrayAsMenuInTelegram(telegramId, header, arrayOfKeyValueToShow, format) {
+    console.info("showArrayAsMenuInTelegram:",
+        "telegramId:", telegramId,
+        "header:", header,
+        "arrayOfKeyValueToShow:", arrayOfKeyValueToShow,
+        "format:", format);
+    const markup = formatArrayAsMenuForTelegram(header, arrayOfKeyValueToShow, format);
+
+    console.info("showArrayAsMenuInTelegram0", JSON.stringify(markup));
+    console.info("showArrayAsMenuInTelegram1", markup);
+    let res;
+    try {
+        res = await bot.sendMessage(telegramId, header, markup);
+    } catch (err) {
+        console.error(err);
+        return err;
+    }
+
+    console.info("showArrayAsMenuInTelegram sent", res);
+    return res;
+}
+
+/**
+ * getFileFromTelegram
+ * @param fileId
+ * @returns {Promise&lt;any>}
+ */
+function getFileFromTelegram(fileId) {
+    return new Promise((resolve, reject) => {
+        const buffer = [];
+        const fileStream = bot.getFileStream(fileId);
+        fileStream.on('data', (data) => buffer.push(data));
+
+        fileStream.on('end', () => {
+            return resolve(data);
+        });
+
+        fileStream.on('error', err => {
+            console.error("getFileFromTelegram", fileId, "error", err);
+            reject(err);
+        });
+    });
+}
+
+/**
+ * deleteLastMessagesFromTelegram
+ * @param user
+ * @returns {Promise&lt;void>}
+ */
+async function deleteLastMessagesFromTelegram(user) {
+    console.info("deleteLastMessagesFromTelegram", user);
+    if (user.messageCache &amp;&amp; user.messageCache.length) {
+        for (let i in user.messageCache) {
+            if (user.messageCache.hasOwnProperty(i)) {
+                try {
+                    await bot.deleteMessage(user.telegramId,
+                        user.messageCache[i]);
+                } catch (e) {
+                    //message maybe not found
+                    console.info("deleteLastMessagesFromTelegram deleteMessage not found", i, user.messageCache);
+                }
+                user.messageCache.pop();
+            }
+        }
+    }
+
+    await user.save();
+    console.info("deleteLastMessagesFromTelegram exiting", user);
+}
+
+export {
+    showArrayAsMenuInTelegram,
+    sendMessageToTelegram,
+    getFileFromTelegram,
+    sendPhotoToTelegram,
+    formatArrayAsMenuForTelegram,
+    sendMediaGroupToTelegram,
+    deleteLastMessagesFromTelegram
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Global</h3><ul><li><a href="global.html#accQuest">accQuest</a></li><li><a href="global.html#accTeachProp">accTeachProp</a></li><li><a href="global.html#addActionWithIdToEveryArrayItem">addActionWithIdToEveryArrayItem</a></li><li><a href="global.html#addAllTeachersAsFavorite">addAllTeachersAsFavorite</a></li><li><a href="global.html#addButtonToMenu">addButtonToMenu</a></li><li><a href="global.html#addFavoriteTeacher">addFavoriteTeacher</a></li><li><a href="global.html#addOnlineTeachersForEveryTopic">addOnlineTeachersForEveryTopic</a></li><li><a href="global.html#addStudent">addStudent</a></li><li><a href="global.html#addTeacher">addTeacher</a></li><li><a href="global.html#authenticateUser">authenticateUser</a></li><li><a href="global.html#callWizIq">callWizIq</a></li><li><a href="global.html#cancelQuestion">cancelQuestion</a></li><li><a href="global.html#changeClass">changeClass</a></li><li><a href="global.html#changeTeacher">changeTeacher</a></li><li><a href="global.html#checkFirstName">checkFirstName</a></li><li><a href="global.html#checkForExistingLambdaContainer">checkForExistingLambdaContainer</a></li><li><a href="global.html#checkIfAlreadySentTheProposal">checkIfAlreadySentTheProposal</a></li><li><a href="global.html#checkIfEventBodyIsJSON">checkIfEventBodyIsJSON</a></li><li><a href="global.html#checkLastName">checkLastName</a></li><li><a href="global.html#checkUserRegistration">checkUserRegistration</a></li><li><a href="global.html#checkUserState">checkUserState</a></li><li><a href="global.html#checkUsersubMachine">checkUsersubMachine</a></li><li><a href="global.html#chooseTopic">chooseTopic</a></li><li><a href="global.html#chunkArrayIntoArrayOfArrays">chunkArrayIntoArrayOfArrays</a></li><li><a href="global.html#cleanStart">cleanStart</a></li><li><a href="global.html#clearUser">clearUser</a></li><li><a href="global.html#clearUserTopics">clearUserTopics</a></li><li><a href="global.html#confirmQuestion">confirmQuestion</a></li><li><a href="global.html#createClass">createClass</a></li><li><a href="global.html#createNewUser">createNewUser</a></li><li><a href="global.html#createSignature">createSignature</a></li><li><a href="global.html#createSubMachineForUser">createSubMachineForUser</a></li><li><a href="global.html#defaultValidation">defaultValidation</a></li><li><a href="global.html#deleteLastMessages">deleteLastMessages</a></li><li><a href="global.html#deleteLastMessagesFromTelegram">deleteLastMessagesFromTelegram</a></li><li><a href="global.html#denQuest">denQuest</a></li><li><a href="global.html#emptyQuestionsQueue">emptyQuestionsQueue</a></li><li><a href="global.html#endTheClass">endTheClass</a></li><li><a href="global.html#findOrCreateAStateMachineForTheUser">findOrCreateAStateMachineForTheUser</a></li><li><a href="global.html#findTopicByName">findTopicByName</a></li><li><a href="global.html#finishSubmachine">finishSubmachine</a></li><li><a href="global.html#finishSubmachineIfNeeded">finishSubmachineIfNeeded</a></li><li><a href="global.html#formatArrayAsMenuForTelegram">formatArrayAsMenuForTelegram</a></li><li><a href="global.html#formatQuestionWithOnePicture">formatQuestionWithOnePicture</a></li><li><a href="global.html#formatQuestionWithoutPictures">formatQuestionWithoutPictures</a></li><li><a href="global.html#formatQuestionWithSeveralPictures">formatQuestionWithSeveralPictures</a></li><li><a href="global.html#generateTimeStamp">generateTimeStamp</a></li><li><a href="global.html#getActionFrom">getActionFrom</a></li><li><a href="global.html#getClassXMLreportFromEvent">getClassXMLreportFromEvent</a></li><li><a href="global.html#getFavoriteTeacherLineForList">getFavoriteTeacherLineForList</a></li><li><a href="global.html#getFavoriteTeachersList">getFavoriteTeachersList</a></li><li><a href="global.html#getFileFromTelegram">getFileFromTelegram</a></li><li><a href="global.html#getNextQuestionAndSend">getNextQuestionAndSend</a></li><li><a href="global.html#getPayloadFrom">getPayloadFrom</a></li><li><a href="global.html#getPhotoFromDb">getPhotoFromDb</a></li><li><a href="global.html#getPhotoFromDbAndSend">getPhotoFromDbAndSend</a></li><li><a href="global.html#getStudentsTimesFromReport">getStudentsTimesFromReport</a></li><li><a href="global.html#getTelegramIdFrom">getTelegramIdFrom</a></li><li><a href="global.html#getTopicButtonsFromArrayOf">getTopicButtonsFromArrayOf</a></li><li><a href="global.html#getTopicsArrayFromDb">getTopicsArrayFromDb</a></li><li><a href="global.html#getTopicsFromDbExcluding">getTopicsFromDbExcluding</a></li><li><a href="global.html#getUser">getUser</a></li><li><a href="global.html#getUserAndStates">getUserAndStates</a></li><li><a href="global.html#getWizIqLink">getWizIqLink</a></li><li><a href="global.html#itIsDevBot">itIsDevBot</a></li><li><a href="global.html#listActiveQuestionsToTopic">listActiveQuestionsToTopic</a></li><li><a href="global.html#mySubscriptions">mySubscriptions</a></li><li><a href="global.html#newStateAction">newStateAction</a></li><li><a href="global.html#parsePromise">parsePromise</a></li><li><a href="global.html#parseWizIqEvent">parseWizIqEvent</a></li><li><a href="global.html#prepareQuestionsList">prepareQuestionsList</a></li><li><a href="global.html#printActiveQuestionsOnTopicToTeacher">printActiveQuestionsOnTopicToTeacher</a></li><li><a href="global.html#printAllQuestions">printAllQuestions</a></li><li><a href="global.html#processAction">processAction</a></li><li><a href="global.html#processAdminCommand">processAdminCommand</a></li><li><a href="global.html#rateUser">rateUser</a></li><li><a href="global.html#rechargeBalance">rechargeBalance</a></li><li><a href="global.html#recreateSubMachine">recreateSubMachine</a></li><li><a href="global.html#removeFavoriteTeacher">removeFavoriteTeacher</a></li><li><a href="global.html#requestDiplomas">requestDiplomas</a></li><li><a href="global.html#requestEmail">requestEmail</a></li><li><a href="global.html#requestFirstName">requestFirstName</a></li><li><a href="global.html#requestLastName">requestLastName</a></li><li><a href="global.html#requestNote">requestNote</a></li><li><a href="global.html#requestPassword">requestPassword</a></li><li><a href="global.html#requestPasswordConfirmation">requestPasswordConfirmation</a></li><li><a href="global.html#requestPhoneNumber">requestPhoneNumber</a></li><li><a href="global.html#requestProfilePicture">requestProfilePicture</a></li><li><a href="global.html#requestQuestionPictures">requestQuestionPictures</a></li><li><a href="global.html#requestQuestionText">requestQuestionText</a></li><li><a href="global.html#requestQuestionTopic">requestQuestionTopic</a></li><li><a href="global.html#requestTeacherRate">requestTeacherRate</a></li><li><a href="global.html#requestTopics">requestTopics</a></li><li><a href="global.html#requestUserRole">requestUserRole</a></li><li><a href="global.html#resetTheBotForUser">resetTheBotForUser</a></li><li><a href="global.html#reverification">reverification</a></li><li><a href="global.html#runIneedHelp">runIneedHelp</a></li><li><a href="global.html#saveQuestionPictures">saveQuestionPictures</a></li><li><a href="global.html#saveQuestionText">saveQuestionText</a></li><li><a href="global.html#saveQuestionTopic">saveQuestionTopic</a></li><li><a href="global.html#saveUserState">saveUserState</a></li><li><a href="global.html#saveWizIqTeacherIdToDb">saveWizIqTeacherIdToDb</a></li><li><a href="global.html#sendMediaGroupToTelegram">sendMediaGroupToTelegram</a></li><li><a href="global.html#sendMessageToTelegram">sendMessageToTelegram</a></li><li><a href="global.html#sendPhotoToTelegram">sendPhotoToTelegram</a></li><li><a href="global.html#sendProposalToStudent">sendProposalToStudent</a></li><li><a href="global.html#sendQuestion">sendQuestion</a></li><li><a href="global.html#sendQuestionToTeacher">sendQuestionToTeacher</a></li><li><a href="global.html#sendQuestionToTeachers">sendQuestionToTeachers</a></li><li><a href="global.html#sendRegisteredMessage">sendRegisteredMessage</a></li><li><a href="global.html#sendSampleQuestion">sendSampleQuestion</a></li><li><a href="global.html#sendTopicsToChooseFrom">sendTopicsToChooseFrom</a></li><li><a href="global.html#sendUserForVerification">sendUserForVerification</a></li><li><a href="global.html#setTheClassOver">setTheClassOver</a></li><li><a href="global.html#setUserRating">setUserRating</a></li><li><a href="global.html#setUserRole">setUserRole</a></li><li><a href="global.html#showArrayAsMenuInTelegram">showArrayAsMenuInTelegram</a></li><li><a href="global.html#showDashboard">showDashboard</a></li><li><a href="global.html#showFavoriteTeachers">showFavoriteTeachers</a></li><li><a href="global.html#showMenuRegisterOrEnter">showMenuRegisterOrEnter</a></li><li><a href="global.html#showQuestionsHistory">showQuestionsHistory</a></li><li><a href="global.html#showUserProfile">showUserProfile</a></li><li><a href="global.html#shTeachProf">shTeachProf</a></li><li><a href="global.html#signInPasswordRequest">signInPasswordRequest</a></li><li><a href="global.html#subscribeToTopic">subscribeToTopic</a></li><li><a href="global.html#switchTeacherAvailability">switchTeacherAvailability</a></li><li><a href="global.html#topicsSelected">topicsSelected</a></li><li><a href="global.html#translateAllTopics">translateAllTopics</a></li><li><a href="global.html#underConstruction">underConstruction</a></li><li><a href="global.html#unSubscribeFromTopic">unSubscribeFromTopic</a></li><li><a href="global.html#validateUserData">validateUserData</a></li><li><a href="global.html#validateUserDataInput">validateUserDataInput</a></li><li><a href="global.html#whoAmI">whoAmI</a></li><li><a href="global.html#wrongEvent">wrongEvent</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.3</a> on Thu Aug 22 2019 02:46:17 GMT+0300 (Moscow Standard Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
